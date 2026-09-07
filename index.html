@@ -317,21 +317,30 @@ function startGame() {
 }
 startBtn.addEventListener("click", () => {
   if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
-  actx.resume(); startGame();
+  actx.resume(); video.play().catch(() => {}); startGame();
 });
 renderHud();
 
 // ---------- Hand tracking ----------
-let landmarker = null;
-async function initHands() {
-  const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
-  landmarker = await HandLandmarker.createFromOptions(vision, {
-    baseOptions: {
-      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
-      delegate: "GPU",
-    },
-    runningMode: "VIDEO", numHands: 2, minHandDetectionConfidence: .5, minHandPresenceConfidence: .5, minTrackingConfidence: .5,
+let landmarker = null, vision = null, delegate = "GPU", detectErrors = 0;
+const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+async function createLandmarker(d) {
+  return HandLandmarker.createFromOptions(vision, {
+    baseOptions: { modelAssetPath: MODEL_URL, delegate: d },
+    runningMode: "VIDEO", numHands: 2, minHandDetectionConfidence: .3, minHandPresenceConfidence: .3, minTrackingConfidence: .3,
   });
+}
+async function initHands() {
+  vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  try { landmarker = await createLandmarker("GPU"); delegate = "GPU"; }
+  catch (e) { console.warn("GPU delegate failed, using CPU", e); landmarker = await createLandmarker("CPU"); delegate = "CPU"; }
+}
+async function fallbackToCpu(err) {
+  if (delegate === "CPU") return;
+  console.warn("detect failed on GPU, switching to CPU", err);
+  const old = landmarker; landmarker = null; delegate = "CPU";
+  try { old.close(); } catch (_) {}
+  landmarker = await createLandmarker("CPU");
 }
 async function initCamera() {
   const stream = await navigator.mediaDevices.getUserMedia({
@@ -372,7 +381,7 @@ function processHands(result) {
     lastHands = []; G.aim = null; smoothAim = null; G.touching = false;
     if (G.handSeen) { G.handSeen = false; G.lastHandTime = now; }
     else if (now - G.lastHandTime > NO_HAND_RELOAD_MS && G.running) reload();
-    statusEl.innerHTML = G.running ? "손을 올려 조준하세요" : "손이 보이지 않음";
+    statusEl.innerHTML = (G.running ? "손을 올려 조준하세요" : "손이 보이지 않음") + debugLine(0);
     return;
   }
   G.handSeen = true;
@@ -406,16 +415,23 @@ function processHands(result) {
   G.touching = touching;
 
   lastHands = hands.map(h => ({ role: h.role, pts: h.lm.map(toScreen) }));
-  statusEl.innerHTML = trig
+  statusEl.innerHTML = (trig
     ? (touching ? "<b>FIRE!</b>" : "반대손으로 총 손을 터치 → 발사")
-    : "반대손을 올리세요 (트리거)";
+    : "반대손을 올리세요 (트리거)") + debugLine(hands.length);
 }
 
+let fpsCount = 0, fps = 0, fpsAt = performance.now();
+function debugLine(n) {
+  fpsCount++; const now = performance.now();
+  if (now - fpsAt > 1000) { fps = fpsCount; fpsCount = 0; fpsAt = now; }
+  return `<br><small style="color:#777">${delegate} · ${video.videoWidth}x${video.videoHeight} · ${fps}fps · hands:${n}</small>`;
+}
 function detectLoop() {
   if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
     lastVideoTime = video.currentTime;
     let result = null;
-    try { result = landmarker.detectForVideo(video, performance.now()); } catch (e) { console.warn(e); }
+    try { result = landmarker.detectForVideo(video, Math.round(performance.now())); detectErrors = 0; }
+    catch (e) { detectErrors++; console.warn(e); if (detectErrors >= 3) { detectErrors = 0; fallbackToCpu(e); } }
     processHands(result);
   }
   requestAnimationFrame(detectLoop);
