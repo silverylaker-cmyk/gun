@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Finger Gun: Dead Alley</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; color: #eee;
+    font-family: "Segoe UI", Roboto, "Noto Sans KR", sans-serif; touch-action: none; user-select: none; }
+  #video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); opacity: .35; }
+  #game { position: fixed; inset: 0; width: 100%; height: 100%; }
+  #hud { position: fixed; inset: 0; pointer-events: none; padding: max(12px, env(safe-area-inset-top)) 14px; }
+  .top { display: flex; justify-content: space-between; align-items: flex-start; font-weight: 700; text-shadow: 0 2px 6px #000; }
+  .score { font-size: 22px; color: #ffd54a; }
+  .wave { font-size: 14px; color: #9ad; margin-top: 2px; }
+  .hp { display: flex; gap: 4px; }
+  .hp span { width: 18px; height: 18px; background: #e33; clip-path: polygon(50% 100%, 0 40%, 15% 5%, 50% 25%, 85% 5%, 100% 40%); }
+  .hp span.off { background: #444; }
+  .bottom { position: absolute; left: 14px; right: 14px; bottom: max(14px, env(safe-area-inset-bottom));
+    display: flex; justify-content: space-between; align-items: flex-end; }
+  .ammo { display: flex; gap: 3px; }
+  .ammo i { display: block; width: 7px; height: 22px; background: #ffb300; border-radius: 3px 3px 1px 1px; }
+  .ammo i.off { background: #333; }
+  .status { font-size: 13px; color: #aaa; text-align: right; text-shadow: 0 1px 4px #000; }
+  .status b { color: #fff; }
+  #msg { position: fixed; left: 50%; top: 40%; transform: translate(-50%, -50%); font-size: 28px; font-weight: 900;
+    color: #fff; text-shadow: 0 0 20px #f33, 0 2px 8px #000; opacity: 0; transition: opacity .2s; pointer-events: none; text-align: center; }
+  #msg.show { opacity: 1; }
+  #overlay { position: fixed; inset: 0; background: rgba(0,0,0,.82); display: flex; flex-direction: column;
+    align-items: center; justify-content: center; text-align: center; padding: 28px; gap: 16px; z-index: 10; }
+  #overlay h1 { font-size: 34px; letter-spacing: 2px; color: #ffd54a; text-shadow: 0 0 24px #f33; }
+  #overlay p { color: #ccc; line-height: 1.6; font-size: 15px; max-width: 420px; }
+  #overlay button { font-size: 20px; font-weight: 800; padding: 14px 40px; border: 0; border-radius: 40px;
+    background: #e33; color: #fff; box-shadow: 0 6px 20px rgba(255,50,50,.5); }
+  #overlay button:disabled { background: #555; box-shadow: none; }
+  #overlay .final { font-size: 22px; color: #fff; }
+  #flash { position: fixed; inset: 0; background: #f00; opacity: 0; pointer-events: none; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<video id="video" autoplay playsinline muted></video>
+<canvas id="game"></canvas>
+<div id="flash"></div>
+<div id="hud">
+  <div class="top">
+    <div><div class="score">SCORE <span id="score">0</span></div><div class="wave">WAVE <span id="wave">1</span></div></div>
+    <div class="hp" id="hp"></div>
+  </div>
+  <div class="bottom">
+    <div class="ammo" id="ammo"></div>
+    <div class="status" id="status">카메라 준비 중...</div>
+  </div>
+</div>
+<div id="msg"></div>
+<div id="overlay">
+  <h1>FINGER GUN<br>DEAD ALLEY</h1>
+  <p>
+    ✋ 한 손으로 <b>총 모양</b>(검지 펴기)을 만들면 검지 끝이 조준점이 됩니다.<br>
+    👉 <b>반대손 검지로 총 손을 터치</b>하면 발사!<br>
+    🔄 손을 카메라 밖으로 내리면 <b>재장전</b>됩니다.<br>
+    좀비가 가까이 오기 전에 쏘세요.
+  </p>
+  <p id="loadmsg" style="color:#9ad">손 인식 모델 로딩 중...</p>
+  <button id="start" disabled>START</button>
+</div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const $ = id => document.getElementById(id);
+const overlay = $("overlay"), startBtn = $("start"), loadmsg = $("loadmsg");
+const msgEl = $("msg"), flashEl = $("flash"), statusEl = $("status");
+
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+window.addEventListener("resize", resize); resize();
+
+// ---------- Audio (synth, no assets) ----------
+let actx = null;
+function beep(type, freq, dur, vol = .3, slide = 0) {
+  if (!actx) return;
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = type; o.frequency.value = freq;
+  if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(20, freq + slide), actx.currentTime + dur);
+  g.gain.value = vol; g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+  o.connect(g).connect(actx.destination); o.start(); o.stop(actx.currentTime + dur);
+}
+function noise(dur, vol = .4) {
+  if (!actx) return;
+  const buf = actx.createBuffer(1, actx.sampleRate * dur, actx.sampleRate);
+  const d = buf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / d.length);
+  const s = actx.createBufferSource(), g = actx.createGain(); s.buffer = buf; g.gain.value = vol;
+  s.connect(g).connect(actx.destination); s.start();
+}
+const sfx = {
+  shoot: () => { noise(.12, .5); beep("square", 180, .1, .25, -150); },
+  empty: () => beep("square", 300, .08, .15),
+  reload: () => { beep("triangle", 500, .08, .2); setTimeout(() => beep("triangle", 800, .1, .2), 110); },
+  hit: () => beep("sawtooth", 240, .18, .3, -180),
+  kill: () => { beep("sawtooth", 120, .3, .35, -90); noise(.2, .3); },
+  hurt: () => { beep("sawtooth", 90, .5, .5, -60); noise(.4, .5); },
+  wave: () => { [440, 550, 660, 880].forEach((f, i) => setTimeout(() => beep("square", f, .15, .2), i * 120)); },
+};
+
+// ---------- Game state ----------
+const MAX_AMMO = 6, MAX_HP = 5;
+const G = {
+  running: false, score: 0, wave: 1, hp: MAX_HP, ammo: MAX_AMMO,
+  enemies: [], particles: [], shots: [], spawnTimer: 0, killsThisWave: 0, waveTarget: 8,
+  aim: null,          // {x,y} screen px, null if no gun hand
+  gunHand: null, triggerHand: null, handSeen: true, lastHandTime: 0, needReload: false,
+  touching: false, lastShotAt: 0, t: 0, last: 0,
+};
+
+function setMsg(text, ms = 1200) {
+  msgEl.textContent = text; msgEl.classList.add("show");
+  clearTimeout(setMsg.tid); setMsg.tid = setTimeout(() => msgEl.classList.remove("show"), ms);
+}
+function renderHud() {
+  $("score").textContent = G.score; $("wave").textContent = G.wave;
+  $("hp").innerHTML = Array.from({ length: MAX_HP }, (_, i) => `<span class="${i < G.hp ? "" : "off"}"></span>`).join("");
+  $("ammo").innerHTML = Array.from({ length: MAX_AMMO }, (_, i) => `<i class="${i < G.ammo ? "" : "off"}"></i>`).join("");
+}
+
+// ---------- Enemies ----------
+const ENEMY_TYPES = [
+  { name: "zombie", color: "#6a9a3a", speed: .055, hp: 1, score: 100, r: 1 },
+  { name: "brute", color: "#8a4a2a", speed: .035, hp: 3, score: 300, r: 1.35 },
+  { name: "runner", color: "#b0b060", speed: .1, hp: 1, score: 200, r: .8 },
+];
+function spawnEnemy() {
+  const pool = G.wave < 2 ? [0] : G.wave < 4 ? [0, 0, 2] : [0, 0, 1, 2];
+  const type = ENEMY_TYPES[pool[Math.floor(Math.random() * pool.length)]];
+  G.enemies.push({
+    type, hp: type.hp, x: .15 + Math.random() * .7, y: .35 + Math.random() * .3,
+    d: 0, // 0 = far, 1 = at player
+    wobble: Math.random() * Math.PI * 2, hitFlash: 0,
+    speed: type.speed * (1 + (G.wave - 1) * .12),
+  });
+}
+function enemyScreen(e) {
+  const scale = .12 + e.d * e.d * 1.4;           // grows as it approaches
+  const size = Math.min(W, H) * .22 * scale * e.type.r;
+  const sx = e.x * W + Math.sin(G.t * 3 + e.wobble) * size * .08;
+  const sy = e.y * H + e.d * H * .35;
+  return { sx, sy, size };
+}
+function drawEnemy(e) {
+  const { sx, sy, size } = enemyScreen(e);
+  ctx.save(); ctx.translate(sx, sy);
+  const c = e.hitFlash > 0 ? "#fff" : e.type.color;
+  // shadow
+  ctx.fillStyle = "rgba(0,0,0,.4)"; ctx.beginPath(); ctx.ellipse(0, size * .55, size * .5, size * .12, 0, 0, Math.PI * 2); ctx.fill();
+  // body
+  ctx.fillStyle = c; ctx.fillRect(-size * .3, -size * .1, size * .6, size * .65);
+  // arms reaching
+  const reach = Math.sin(G.t * 6 + e.wobble) * size * .05;
+  ctx.fillRect(-size * .55, size * .02 + reach, size * .25, size * .14);
+  ctx.fillRect(size * .3, size * .02 - reach, size * .25, size * .14);
+  // head
+  ctx.beginPath(); ctx.arc(0, -size * .3, size * .26, 0, Math.PI * 2); ctx.fill();
+  // eyes
+  ctx.fillStyle = e.hitFlash > 0 ? "#000" : "#ff3030";
+  ctx.beginPath(); ctx.arc(-size * .09, -size * .33, size * .05, 0, Math.PI * 2); ctx.arc(size * .09, -size * .33, size * .05, 0, Math.PI * 2); ctx.fill();
+  // mouth
+  ctx.fillStyle = "#200"; ctx.fillRect(-size * .1, -size * .2, size * .2, size * .05);
+  // hp bar for brute
+  if (e.type.hp > 1) {
+    ctx.fillStyle = "#300"; ctx.fillRect(-size * .3, -size * .68, size * .6, size * .06);
+    ctx.fillStyle = "#f33"; ctx.fillRect(-size * .3, -size * .68, size * .6 * (e.hp / e.type.hp), size * .06);
+  }
+  ctx.restore();
+}
+function enemyHitTest(e, px, py) {
+  const { sx, sy, size } = enemyScreen(e);
+  return Math.abs(px - sx) < size * .5 && py > sy - size * .6 && py < sy + size * .6;
+}
+
+// ---------- Shooting ----------
+function tryShoot() {
+  if (!G.running || !G.aim) return;
+  const now = performance.now();
+  if (now - G.lastShotAt < 180) return;
+  G.lastShotAt = now;
+  if (G.ammo <= 0) { sfx.empty(); setMsg("재장전! 손을 화면 밖으로", 900); G.needReload = true; return; }
+  G.ammo--; sfx.shoot(); renderHud();
+  const { x, y } = G.aim;
+  G.shots.push({ x, y, t: 0 });
+  // hit the nearest (largest d) enemy under the crosshair
+  let target = null;
+  for (const e of G.enemies) if (enemyHitTest(e, x, y) && (!target || e.d > target.d)) target = e;
+  if (target) {
+    target.hp--; target.hitFlash = .12;
+    spawnBlood(x, y, 10);
+    if (target.hp <= 0) {
+      sfx.kill(); G.enemies.splice(G.enemies.indexOf(target), 1);
+      const bonus = Math.round(target.type.score * (1 - target.d * .5));
+      G.score += bonus; G.killsThisWave++; spawnBlood(x, y, 24);
+      setMsg("+" + bonus, 500);
+    } else sfx.hit();
+    renderHud();
+  }
+  if (G.ammo === 0) { G.needReload = true; setMsg("EMPTY - 손을 내려 재장전", 1000); }
+}
+function reload() {
+  if (G.ammo === MAX_AMMO) return;
+  G.ammo = MAX_AMMO; G.needReload = false; sfx.reload(); setMsg("RELOADED", 700); renderHud();
+}
+function spawnBlood(x, y, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, s = 60 + Math.random() * 220;
+    G.particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 80, life: .5 + Math.random() * .4, r: 2 + Math.random() * 4 });
+  }
+}
+
+// ---------- Loop ----------
+function update(dt) {
+  G.t += dt;
+  if (G.running) {
+    G.spawnTimer -= dt;
+    const maxOnScreen = Math.min(3 + G.wave, 8);
+    if (G.spawnTimer <= 0 && G.enemies.length < maxOnScreen) {
+      spawnEnemy(); G.spawnTimer = Math.max(.5, 2.2 - G.wave * .2) * (.6 + Math.random() * .8);
+    }
+    for (const e of [...G.enemies]) {
+      e.d += e.speed * dt; e.hitFlash -= dt;
+      if (e.d >= 1) {
+        G.enemies.splice(G.enemies.indexOf(e), 1);
+        G.hp--; sfx.hurt(); flashEl.style.opacity = .6; setTimeout(() => flashEl.style.opacity = 0, 150);
+        renderHud();
+        if (G.hp <= 0) gameOver();
+      }
+    }
+    if (G.killsThisWave >= G.waveTarget) {
+      G.wave++; G.killsThisWave = 0; G.waveTarget = 8 + G.wave * 2; sfx.wave(); setMsg("WAVE " + G.wave, 1500); renderHud();
+    }
+  }
+  for (const p of [...G.particles]) {
+    p.life -= dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 500 * dt;
+    if (p.life <= 0) G.particles.splice(G.particles.indexOf(p), 1);
+  }
+  for (const s of [...G.shots]) { s.t += dt; if (s.t > .15) G.shots.splice(G.shots.indexOf(s), 1); }
+}
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  // atmosphere: ground fog gradient
+  const g = ctx.createLinearGradient(0, H * .4, 0, H);
+  g.addColorStop(0, "rgba(0,0,0,0)"); g.addColorStop(1, "rgba(40,0,0,.55)");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // enemies, far to near
+  G.enemies.sort((a, b) => a.d - b.d).forEach(drawEnemy);
+  // blood
+  for (const p of G.particles) { ctx.fillStyle = `rgba(200,20,20,${Math.min(1, p.life * 2)})`; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill(); }
+  // muzzle flash / bullet holes
+  for (const s of G.shots) {
+    ctx.fillStyle = `rgba(255,220,80,${1 - s.t / .15})`; ctx.beginPath(); ctx.arc(s.x, s.y, 26 * (1 - s.t / .15) + 6, 0, Math.PI * 2); ctx.fill();
+  }
+  // hand skeleton hints
+  drawHands();
+  // crosshair
+  if (G.aim) {
+    const { x, y } = G.aim; const r = 22;
+    ctx.strokeStyle = G.needReload ? "#888" : G.touching ? "#ff0" : "#0f8"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x - r - 10, y); ctx.lineTo(x - r + 8, y); ctx.moveTo(x + r + 10, y); ctx.lineTo(x + r - 8, y);
+    ctx.moveTo(x, y - r - 10); ctx.lineTo(x, y - r + 8); ctx.moveTo(x, y + r + 10); ctx.lineTo(x, y + r - 8);
+    ctx.stroke();
+    ctx.fillStyle = "#f33"; ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill();
+  }
+}
+let lastHands = [];
+function drawHands() {
+  ctx.lineWidth = 2;
+  for (const h of lastHands) {
+    ctx.strokeStyle = h.role === "gun" ? "rgba(0,255,140,.5)" : h.role === "trigger" ? "rgba(255,255,0,.5)" : "rgba(255,255,255,.25)";
+    for (const [a, b] of CONNECTIONS) {
+      ctx.beginPath(); ctx.moveTo(h.pts[a].x, h.pts[a].y); ctx.lineTo(h.pts[b].x, h.pts[b].y); ctx.stroke();
+    }
+  }
+}
+const CONNECTIONS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+
+function frame(now) {
+  const dt = Math.min(.05, (now - G.last) / 1000 || 0); G.last = now;
+  update(dt); draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+function gameOver() {
+  G.running = false;
+  overlay.classList.remove("hidden");
+  overlay.querySelector("h1").textContent = "GAME OVER";
+  overlay.querySelectorAll("p").forEach(p => p.remove());
+  const p = document.createElement("p"); p.className = "final";
+  p.innerHTML = `SCORE <b style="color:#ffd54a">${G.score}</b> · WAVE ${G.wave}`;
+  overlay.insertBefore(p, startBtn); startBtn.textContent = "RETRY";
+}
+function startGame() {
+  Object.assign(G, { running: true, score: 0, wave: 1, hp: MAX_HP, ammo: MAX_AMMO, enemies: [], particles: [], shots: [],
+    spawnTimer: .5, killsThisWave: 0, waveTarget: 8, needReload: false });
+  overlay.classList.add("hidden"); renderHud(); sfx.wave(); setMsg("WAVE 1", 1200);
+}
+startBtn.addEventListener("click", () => {
+  if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+  actx.resume(); startGame();
+});
+renderHud();
+
+// ---------- Hand tracking ----------
+let landmarker = null;
+async function initHands() {
+  const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  landmarker = await HandLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate: "GPU",
+    },
+    runningMode: "VIDEO", numHands: 2, minHandDetectionConfidence: .5, minHandPresenceConfidence: .5, minTrackingConfidence: .5,
+  });
+}
+async function initCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } }, audio: false,
+  });
+  video.srcObject = stream;
+  await new Promise(r => video.onloadedmetadata = r);
+  await video.play();
+}
+
+// map a normalized landmark (video space, mirrored) to screen px, honoring object-fit: cover
+function toScreen(lm) {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const scale = Math.max(W / vw, H / vh);
+  const dw = vw * scale, dh = vh * scale;
+  const ox = (W - dw) / 2, oy = (H - dh) / 2;
+  return { x: ox + (1 - lm.x) * dw, y: oy + lm.y * dh };
+}
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, (a.z || 0) - (b.z || 0));
+// Finger extension: tip farther from wrist than PIP joint
+function fingerExtended(lm, tip, pip) { return dist(lm[tip], lm[0]) > dist(lm[pip], lm[0]) * 1.15; }
+function gunScore(lm) {
+  // index extended, middle/ring/pinky curled → gun pose
+  const idx = fingerExtended(lm, 8, 6);
+  const curled = [[12, 10], [16, 14], [20, 18]].filter(([t, p]) => !fingerExtended(lm, t, p)).length;
+  return (idx ? 2 : 0) + curled;
+}
+
+let smoothAim = null;
+const NO_HAND_RELOAD_MS = 450;
+let lastVideoTime = -1;
+
+function processHands(result) {
+  const hands = (result?.landmarks || []).map(lm => ({ lm, score: gunScore(lm), role: "" }));
+  const now = performance.now();
+
+  if (hands.length === 0) {
+    lastHands = []; G.aim = null; smoothAim = null; G.touching = false;
+    if (G.handSeen) { G.handSeen = false; G.lastHandTime = now; }
+    else if (now - G.lastHandTime > NO_HAND_RELOAD_MS && G.running) reload();
+    statusEl.innerHTML = G.running ? "손을 올려 조준하세요" : "손이 보이지 않음";
+    return;
+  }
+  G.handSeen = true;
+
+  // gun hand = best gun-pose score; the other hand is the trigger hand
+  hands.sort((a, b) => b.score - a.score);
+  const gun = hands[0]; gun.role = "gun";
+  const trig = hands[1]; if (trig) trig.role = "trigger";
+
+  // aim = index fingertip of gun hand
+  const tip = toScreen(gun.lm[8]);
+  smoothAim = smoothAim ? { x: smoothAim.x + (tip.x - smoothAim.x) * .45, y: smoothAim.y + (tip.y - smoothAim.y) * .45 } : tip;
+  G.aim = { x: Math.max(0, Math.min(W, smoothAim.x)), y: Math.max(0, Math.min(H, smoothAim.y)) };
+
+  // trigger: trigger hand's index tip (or thumb tip) touches any landmark of the gun hand
+  let touching = false;
+  if (trig) {
+    const handSize = dist(gun.lm[0], gun.lm[9]);       // wrist → middle MCP, scale reference
+    const thresh = handSize * .55;
+    for (const fingerTip of [8, 4]) {
+      const ft = trig.lm[fingerTip];
+      // ignore the gun's own index finger (5..8) so aiming isn't disturbed
+      for (let i = 0; i < 21; i++) {
+        if (i >= 5 && i <= 8) continue;
+        if (dist(ft, gun.lm[i]) < thresh) { touching = true; break; }
+      }
+      if (touching) break;
+    }
+  }
+  if (touching && !G.touching) tryShoot();     // rising edge → one shot per touch
+  G.touching = touching;
+
+  lastHands = hands.map(h => ({ role: h.role, pts: h.lm.map(toScreen) }));
+  statusEl.innerHTML = trig
+    ? (touching ? "<b>FIRE!</b>" : "반대손으로 총 손을 터치 → 발사")
+    : "반대손을 올리세요 (트리거)";
+}
+
+function detectLoop() {
+  if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    let result = null;
+    try { result = landmarker.detectForVideo(video, performance.now()); } catch (e) { console.warn(e); }
+    processHands(result);
+  }
+  requestAnimationFrame(detectLoop);
+}
+
+(async () => {
+  try {
+    loadmsg.textContent = "카메라 권한 요청 중...";
+    await initCamera();
+    loadmsg.textContent = "손 인식 모델 로딩 중... (첫 실행 시 수 초 소요)";
+    await initHands();
+    loadmsg.textContent = "준비 완료! 두 손이 모두 카메라에 보이게 하세요.";
+    startBtn.disabled = false; statusEl.textContent = "손을 올려 조준하세요";
+    detectLoop();
+  } catch (e) {
+    console.error(e);
+    loadmsg.style.color = "#f66";
+    loadmsg.textContent = "초기화 실패: " + (e.message || e) + "\nHTTPS 환경과 카메라 권한이 필요합니다.";
+  }
+})();
+</script>
+</body>
+</html>
